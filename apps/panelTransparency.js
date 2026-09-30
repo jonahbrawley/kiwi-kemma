@@ -24,6 +24,14 @@ let timeoutId;
 let safetyIntervalId;
 let lastForcedAlpha = null; // remember last alpha decided by logic (touch/fullscreen)
 let lastFullscreenState = false; // edge-detect fullscreen state changes
+let overviewHiding = false; // overview still 'visible' but animating out
+let lastPanelColor = null; // last [r,g,b] read from a valid theme node
+let noTransitionIdleId = 0; // idle source that drops kiwi-panel-no-transition
+let colorFixIdleId = 0; // one-shot idle in applyPanelColorFix
+let themeUpdateIdleId = 0; // one-shot idle in forceThemeUpdate
+let colorSchemeIdleId = 0; // one-shot idle after color-scheme change
+let ownBackground = ''; // background declaration we keep on the panel
+let panelStyleSignal;
 
 // Adaptive foreground state
 let bgSettings;
@@ -35,7 +43,7 @@ let contentIcons = new WeakMap(); // St.ImageContent -> 'light' | 'dark' | null
 
 const SAMPLE_SIZE = 32; // wallpaper is downscaled to this before sampling
 const SAMPLE_ROWS = 4;  // top rows only — that's what sits behind the panel
-const LIGHT_THRESHOLD = 0.6;
+const LIGHT_THRESHOLD = 0.45;
 const DARKEN_EFFECT = 'kiwi-tray-darken';
 const LIGHTEN_EFFECT = 'kiwi-tray-lighten';
 const ICON_SAMPLE_SIZE = 24;
@@ -465,8 +473,11 @@ function applyPanelColorFix() {
 
     // Clear the inline background so the theme node reports the class colour
     // instead of the rgba() we last wrote, then rebuild it from that reading.
-    panel.set_style('');
-    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+    setPanelBackground('');
+    if (colorFixIdleId)
+        GLib.Source.remove(colorFixIdleId);
+    colorFixIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        colorFixIdleId = 0;
         if (enabled) updatePanelStyle(lastForcedAlpha);
         return GLib.SOURCE_REMOVE;
     });
@@ -478,6 +489,7 @@ function applyPanelColorFix() {
 function restorePanelStyle() {
     const panel = Main.panel;
     if (!panel) return;
+    ownBackground = '';
     panel.set_style(originalStyle);
     panel.queue_redraw();
 }
@@ -493,6 +505,29 @@ function _isFullscreenActive() {
                 typeof win.is_fullscreen === 'function' && win.is_fullscreen());
     } catch (_e) {
         return false;
+    }
+}
+
+// The shell owns Main.panel.style too: Overview._gestureEnd() replaces it with
+// `transition-duration: Nms;` and _hideDone() nulls it, both wiping our
+// background and exposing the opaque theme colour. Keep what the shell wrote
+// and put our declaration back, synchronously, so no frame paints without it.
+function setPanelBackground(declaration) {
+    const panel = Main.panel;
+    ownBackground = declaration;
+
+    const current = panel.get_style() ?? '';
+    const base = current.replace(/background-color:[^;]*;\s*/g, '');
+    const wanted = `${base}${declaration}`;
+    if (current !== wanted) {
+        panel.set_style(wanted);
+    }
+}
+
+function _cancelNoTransitionIdle() {
+    if (noTransitionIdleId) {
+        GLib.Source.remove(noTransitionIdleId);
+        noTransitionIdleId = 0;
     }
 }
 
@@ -520,9 +555,14 @@ function updatePanelStyle(alpha = null) {
             }
         }
         
-        // In overview, always transparent — hide blur
-        if (Main.overview.visible) {
-            panel.set_style('background-color: transparent !important;');
+        // In overview, always transparent — hide blur. The hide animation is
+        // excluded so the panel takes its final style up front and cross-fades
+        // with the overview instead of jumping once the exit finishes.
+        if (Main.overview.visible && !overviewHiding) {
+            // Keep the theme colour in the style. Reading it back is how the
+            // next update learns it, and `transparent` reads back as black.
+            const { red: r, green: g, blue: b } = panel.get_theme_node().get_background_color();
+            setPanelBackground(`background-color: rgba(${r}, ${g}, ${b}, 0) !important;`);
             updateBlurVisibility(false);
             clearForegroundContrast();
             panel.queue_redraw();
@@ -532,7 +572,7 @@ function updatePanelStyle(alpha = null) {
         // If fullscreen is active, CSS class handles it - skip inline style
         if (fullscreenNow) {
             // Clear any inline style to let CSS rule take effect
-            panel.set_style('');
+            setPanelBackground('');
             updateBlurVisibility(false);
             updateForegroundContrast(1.0);
             panel.queue_redraw();
@@ -546,10 +586,16 @@ function updatePanelStyle(alpha = null) {
             return;
         }
 
-        // Get theme colors for non-fullscreen states
+        // Get theme colors for non-fullscreen states. While the overview is
+        // hiding, the theme node still reflects :overview (transparent, reads
+        // as black), so reuse the last valid reading instead.
         const themeNode = panel.get_theme_node();
         const backgroundColor = themeNode.get_background_color();
-        const [r, g, b] = [backgroundColor.red, backgroundColor.green, backgroundColor.blue];
+        let [r, g, b] = [backgroundColor.red, backgroundColor.green, backgroundColor.blue];
+        if (overviewHiding && lastPanelColor)
+            [r, g, b] = lastPanelColor;
+        else if (!overviewHiding)
+            lastPanelColor = [r, g, b];
 
         if (alpha !== null) {
             lastForcedAlpha = alpha;
@@ -560,13 +606,14 @@ function updatePanelStyle(alpha = null) {
         // Show/hide blur regardless of whether style string changed
         const blurEnabled = settings?.get_boolean('panel-blur');
         updateBlurVisibility(blurEnabled && opacity < 1.0);
-        updateForegroundContrast(opacity, _luminance(backgroundColor));
+        updateForegroundContrast(opacity, _luminance({ red: r, green: g, blue: b }));
 
-        if (panel.get_style() !== newStyle) {
-            panel.set_style(newStyle);
+        if (ownBackground !== newStyle) {
+            setPanelBackground(newStyle);
             panel.queue_redraw();
         }
     } catch (error) {
+        ownBackground = '';
         panel.set_style(originalStyle || '');
     } finally {
         isUpdatingStyle = false;
@@ -589,37 +636,41 @@ function checkWindowTouchingPanel() {
         return;
     }
 
-    const panel = Main.panel;
-    const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
-    const [, panelTop] = panel.get_transformed_position();
-    const threshold = 5 * scale;
-
+    // A maximized window fills the work area, which starts right below the
+    // panel, so it always touches it — no geometry check needed.
     const windowTouching = global.workspace_manager
         .get_active_workspace()
         .list_windows()
-        .some(win => 
+        .some(win =>
             win.is_on_primary_monitor() &&
             win.showing_on_its_workspace() &&
             !win.is_hidden() &&
             win.get_window_type() !== Meta.WindowType.DESKTOP &&
             !win.skip_taskbar &&
-            win.get_frame_rect().y <= (panelTop + panel.height + threshold)
+            win.maximized_horizontally &&
+            win.maximized_vertically
         );
     if (_isFullscreenActive()) {
         updatePanelStyle(1.0);
     } else {
-        updatePanelStyle(windowTouching ? 1.0 : null);
-        if (!windowTouching && lastForcedAlpha !== null) {
-            // Clear forced alpha when no condition applies
+        // Clear before updating: updatePanelStyle(null) falls back to the forced
+        // alpha, so a stale 1.0 would paint one opaque frame first.
+        if (!windowTouching) {
             lastForcedAlpha = null;
         }
+        updatePanelStyle(windowTouching ? 1.0 : null);
     }
 }
 
 function handleWindowSignals(connect = true) {
     if (!connect) {
         windowSignals.forEach(({ actor, signals }) => {
-            signals.forEach(signalId => actor.disconnect(signalId));
+            signals.forEach(signalId => {
+                // Some display signal connections fall back to 0 when the
+                // signal doesn't exist — disconnect(0) would throw
+                if (signalId)
+                    actor.disconnect(signalId);
+            });
         });
         windowSignals = [];
         return;
@@ -764,17 +815,26 @@ function setupSignals() {
         actor: Main.overview,
         signals: [
             Main.overview.connect('showing', () => {
+                overviewHiding = false;
+                _cancelNoTransitionIdle();
+                // Synchronous removal: the show animation keeps its bg fade
+                Main.panel.remove_style_class_name('kiwi-panel-no-transition');
                 updatePanelStyle();
             }),
             Main.overview.connect('hiding', () => {
-                const panel = Main.panel;
-                const backgroundColor = panel.get_theme_node().get_background_color();
-                const { red: r, green: g, blue: b } = backgroundColor;
-                panel.set_style(`background-color: rgba(${r}, ${g}, ${b}, 0) !important;`);
+                overviewHiding = true;
+                // The theme's 250ms background transition would fade the panel
+                // in from the stale :overview reading — suppress it for the exit
+                Main.panel.add_style_class_name('kiwi-panel-no-transition');
+                checkWindowTouchingPanel();
             }),
             Main.overview.connect('hidden', () => {
-                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                    checkWindowTouchingPanel();
+                overviewHiding = false;
+                checkWindowTouchingPanel();
+                // One frame later, so the write above is also transition-free
+                noTransitionIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    noTransitionIdleId = 0;
+                    Main.panel.remove_style_class_name('kiwi-panel-no-transition');
                     return GLib.SOURCE_REMOVE;
                 });
             })
@@ -785,8 +845,12 @@ function setupSignals() {
 function forceThemeUpdate() {
     const panel = Main.panel;
     panel.remove_style_class_name('panel');
-    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+    if (themeUpdateIdleId)
+        GLib.Source.remove(themeUpdateIdleId);
+    themeUpdateIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        themeUpdateIdleId = 0;
         panel.add_style_class_name('panel');
+        ownBackground = '';
         panel.style = null;
         updatePanelStyle();
         return GLib.SOURCE_REMOVE;
@@ -806,11 +870,18 @@ export function enable(_settings) {
     enabled = true;
 
     originalStyle = Main.panel.get_style();
+    panelStyleSignal = Main.panel.connect('notify::style', () => {
+        if (ownBackground)
+            setPanelBackground(ownBackground);
+    });
     interfaceSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
     interfaceSettingsSignal = interfaceSettings.connect('changed::color-scheme', () => {
         updateWallpaperLightness();
         forceThemeUpdate();
-        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        if (colorSchemeIdleId)
+            GLib.Source.remove(colorSchemeIdleId);
+        colorSchemeIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            colorSchemeIdleId = 0;
             updatePanelStyle();
             return GLib.SOURCE_REMOVE;
         });
@@ -864,6 +935,24 @@ export function disable() {
         GLib.Source.remove(safetyIntervalId);
         safetyIntervalId = null;
     }
+    if (panelStyleSignal) {
+        Main.panel.disconnect(panelStyleSignal);
+        panelStyleSignal = null;
+    }
+    _cancelNoTransitionIdle();
+    if (colorFixIdleId) {
+        GLib.Source.remove(colorFixIdleId);
+        colorFixIdleId = 0;
+    }
+    if (themeUpdateIdleId) {
+        GLib.Source.remove(themeUpdateIdleId);
+        themeUpdateIdleId = 0;
+    }
+    if (colorSchemeIdleId) {
+        GLib.Source.remove(colorSchemeIdleId);
+        colorSchemeIdleId = 0;
+    }
+    ownBackground = '';
     
     settingsSignals.forEach(signal => {
         settings.disconnect(signal);
@@ -893,6 +982,7 @@ export function disable() {
     const panel = Main.panel;
     panel.remove_style_class_name('kiwi-panel-fullscreen');
     panel.remove_style_class_name('kiwi-panel-color-inherit');
+    panel.remove_style_class_name('kiwi-panel-no-transition');
     clearForegroundContrast();
     restorePanelStyle();
 
@@ -900,4 +990,6 @@ export function disable() {
     originalStyle = null;
     lastForcedAlpha = null;
     lastFullscreenState = false;
+    overviewHiding = false;
+    lastPanelColor = null;
 }
