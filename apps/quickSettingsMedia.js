@@ -17,22 +17,11 @@ const SMOOTH_SCROLL_THRESHOLD = 1.5;
 // State holders
 let enabled = false;
 let mediaWidget = null;
-let quickSettingsGrid = null;
 let _initTimeoutId = null;
 let mediaIndicator = null;
 let gettextFunc = (message) => message;
 let hideMediaIndicator = false;
 let hideMediaPlayer = false;
-
-// Get QuickSettings grid
-function getQuickSettingsGrid() {
-    if (!quickSettingsGrid) {
-        const quickSettings = Main.panel.statusArea.quickSettings;
-        if (quickSettings && quickSettings.menu)
-            quickSettingsGrid = quickSettings.menu._grid;
-    }
-    return quickSettingsGrid;
-}
 
 export function setHideMediaPlayer(enabled) {
     hideMediaPlayer = enabled;
@@ -58,25 +47,14 @@ export function setHideMediaIndicator(enabled) {
 }
 
 function ensureMediaIndicator() {
-    if (mediaIndicator)
-        return mediaIndicator;
-
-    const quickSettings = Main.panel.statusArea.quickSettings;
-    if (!quickSettings || !quickSettings._indicators)
-        return null;
-
-    const indicator = new St.Icon({
-        icon_name: 'media-playback-start-symbolic',
-        style_class: 'system-status-icon kiwi-media-indicator',
-        visible: false,
-    });
-
-    const container = quickSettings._indicators;
-    if (indicator.get_parent())
-        indicator.get_parent().remove_child(indicator);
-    container.insert_child_at_index(indicator, 0);
-
-    mediaIndicator = indicator;
+    if (!mediaIndicator) {
+        mediaIndicator = new St.Icon({
+            icon_name: 'media-playback-start-symbolic',
+            style_class: 'system-status-icon kiwi-media-indicator',
+            visible: false,
+        });
+        Main.panel.statusArea.quickSettings._indicators.insert_child_at_index(mediaIndicator, 0);
+    }
     return mediaIndicator;
 }
 
@@ -97,9 +75,6 @@ function updateMediaIndicator({ hasPlayers, isPlaying }) {
 
 function destroyMediaIndicator() {
     if (mediaIndicator) {
-        const parent = mediaIndicator.get_parent();
-        if (parent)
-            parent.remove_child(mediaIndicator);
         mediaIndicator.destroy();
         mediaIndicator = null;
     }
@@ -174,7 +149,7 @@ class MediaList extends St.BoxLayout {
 
         if (direction === Clutter.ScrollDirection.SMOOTH) {
             const [dx, dy] = event.get_scroll_delta();
-            if (!Number.isFinite(dx) || Math.abs(dx) < Math.abs(dy) || Math.abs(dx) < SMOOTH_SCROLL_THRESHOLD)
+            if (Math.abs(dx) < Math.abs(dy) || Math.abs(dx) < SMOOTH_SCROLL_THRESHOLD)
                 return Clutter.EVENT_PROPAGATE;
             offset = dx > 0 ? 1 : -1;
         } else if (direction === Clutter.ScrollDirection.LEFT) {
@@ -184,9 +159,6 @@ class MediaList extends St.BoxLayout {
         } else {
             return Clutter.EVENT_PROPAGATE;
         }
-
-        if (offset === 0)
-            return Clutter.EVENT_PROPAGATE;
 
         if (!this._seekPage(offset))
             return Clutter.EVENT_STOP;
@@ -208,8 +180,7 @@ class MediaList extends St.BoxLayout {
             this._scrollUnlockId = null;
             return GLib.SOURCE_REMOVE;
         });
-        if (this._scrollUnlockId && GLib.Source.set_name_by_id)
-            GLib.Source.set_name_by_id(this._scrollUnlockId, '[kiwi] MediaList scroll unlock');
+        GLib.Source.set_name_by_id(this._scrollUnlockId, '[kiwi] MediaList scroll unlock');
     }
 
     _onDestroy() {
@@ -220,11 +191,9 @@ class MediaList extends St.BoxLayout {
             this._scrollUnlockId = null;
         }
 
-        if (this._source) {
-            this._source.disconnectObject(this);
-            this._source.destroy();
-            this._source = null;
-        }
+        this._source.disconnectObject(this);
+        this._source.destroy();
+        this._source = null;
 
         for (const item of this._items.values())
             item.destroy();
@@ -240,13 +209,12 @@ class MediaList extends St.BoxLayout {
         if (!messages.length)
             return;
 
-        const target = messages.find(message => message?._player?.isPlaying()) ?? messages[0];
-        if (target)
-            this._setPage(target, { animate: false });
+        const target = messages.find(message => message._player?.isPlaying()) ?? messages[0];
+        this._setPage(target, { animate: false });
     }
 
     _setPage(to, { animate = true } = {}) {
-        if (!to || this._destroyed)
+        if (this._destroyed)
             return false;
 
         const messages = this._messages;
@@ -268,7 +236,7 @@ class MediaList extends St.BoxLayout {
         this._currentPage = toIndex;
         this.emit('page-updated', toIndex);
 
-        const shouldAnimate = animate && hasPrevious && previous && previous.get_stage();
+        const shouldAnimate = animate && hasPrevious && previous.get_stage();
         if (!shouldAnimate) {
             to.opacity = 255;
             to.translationX = 0;
@@ -305,9 +273,6 @@ class MediaList extends St.BoxLayout {
     }
 
     _seekPage(offset) {
-        if (!offset)
-            return false;
-
         const messages = this._messages;
         if (!messages.length)
             return false;
@@ -391,14 +356,7 @@ class MediaList extends St.BoxLayout {
         if (this._destroyed)
             return;
 
-        const active = [...this._items.keys()].some(player => {
-            try {
-                return player.isPlaying?.();
-            } catch {
-                return false;
-            }
-        });
-
+        const active = [...this._items.keys()].some(player => player.isPlaying());
         this._setPlaybackActive(active);
     }
 
@@ -433,7 +391,7 @@ GObject.registerClass({
 
 class MediaHeader extends St.BoxLayout {
     constructor() {
-        super({ style_class: 'kiwi-header', vertical: true });
+        super({ style_class: 'kiwi-header', orientation: Clutter.Orientation.VERTICAL });
         this.spacing = 4;
         this._headerLabel = new St.Label({
             text: gettextFunc('Media'),
@@ -466,12 +424,12 @@ class MediaHeader extends St.BoxLayout {
 
     set page(page) {
         const nPages = Math.max(1, this._pageIndicator.nPages);
-        const clamped = Math.max(0, Math.min(page ?? 0, nPages - 1));
+        const clamped = Math.max(0, Math.min(page, nPages - 1));
         this._pageIndicator.setCurrentPosition(clamped);
     }
 
     get page() {
-        return this._pageIndicator._currentPosition ?? 0;
+        return this._pageIndicator._currentPosition;
     }
 
     connectPageActivated(callback, target) {
@@ -484,7 +442,7 @@ GObject.registerClass(MediaHeader);
 class MediaWidget extends St.BoxLayout {
     constructor() {
         super({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
             reactive: true,
             style_class: 'kiwi-media',
@@ -560,34 +518,21 @@ GObject.registerClass(MediaWidget);
 // #endregion Media Classes
 
 export function enable(gettext) {
-    gettextFunc = typeof gettext === 'function' ? gettext : (message) => message;
-    if (enabled)
+    gettextFunc = gettext;
+    if (enabled || _initTimeoutId)
         return;
 
     _initTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-        const grid = getQuickSettingsGrid();
-        if (!grid)
-            return GLib.SOURCE_CONTINUE; // Retry if grid not ready
-
+        const grid = Main.panel.statusArea.quickSettings.menu._grid;
         mediaWidget = new MediaWidget();
         mediaWidget.visible = !hideMediaPlayer;
         const existingChildren = grid.get_children?.() ?? [];
         const notificationsActor = existingChildren.find(child =>
-            typeof child.has_style_class_name === 'function' && child.has_style_class_name('kiwi-notifications'));
+            child instanceof St.Widget && child.has_style_class_name('kiwi-notifications'));
 
         const targetIndex = notificationsActor ? existingChildren.indexOf(notificationsActor) : existingChildren.length;
-
-        if (typeof grid.insert_child_at_index === 'function') {
-            grid.insert_child_at_index(mediaWidget, targetIndex);
-        } else if (notificationsActor && typeof grid.insert_child_above === 'function') {
-            grid.insert_child_above(mediaWidget, notificationsActor);
-        } else {
-            grid.add_child(mediaWidget);
-        }
-
-        const layout = grid.layout_manager;
-        if (layout && typeof layout.child_set_property === 'function')
-            layout.child_set_property(grid, mediaWidget, 'column-span', 2);
+        grid.insert_child_at_index(mediaWidget, targetIndex);
+        grid.layout_manager.child_set_property(grid, mediaWidget, 'column-span', 2);
 
         enabled = true;
         _initTimeoutId = null;
@@ -596,17 +541,12 @@ export function enable(gettext) {
 }
 
 export function disable() {
-    if (!enabled)
-        return;
-
     if (_initTimeoutId) {
         GLib.Source.remove(_initTimeoutId);
         _initTimeoutId = null;
     }
 
-    const grid = getQuickSettingsGrid();
-    if (grid && mediaWidget) {
-        grid.remove_child(mediaWidget);
+    if (mediaWidget) {
         mediaWidget.destroy();
         mediaWidget = null;
     }

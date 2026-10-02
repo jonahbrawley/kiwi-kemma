@@ -35,10 +35,6 @@ const SHELL = {
 };
 
 export default class KiwiPreferences extends ExtensionPreferences {
-    constructor(metadata) {
-        super(metadata);
-    }
-
     _createLinkRow(title, url, subtitle = null, prefixGicon = null) {
         const row = new Adw.ActionRow({
             title,
@@ -119,24 +115,17 @@ export default class KiwiPreferences extends ExtensionPreferences {
         window.title = extensionTitle;
         window.set_default_size(510, 710);
         // Enable built-in libadwaita search (adds search button automatically)
-        if (window.set_search_enabled)
-            window.set_search_enabled(true);
+        window.set_search_enabled(true);
 
         // Add custom icons path to GTK icon theme search path
         const iconTheme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default());
         const iconsPath = GLib.build_filenamev([this.path, 'icons']);
         iconTheme.add_search_path(iconsPath);
 
-        // Ensure custom CSS for version pill is loaded once per display
-        if (!window._kiwiVersionCssProvider) {
-            const cssProvider = new Gtk.CssProvider();
-            const cssPath = GLib.build_filenamev([this.path, 'css', 'prefs.css']);
-            cssProvider.load_from_path(cssPath);
-            const display = Gdk.Display.get_default();
-            if (display)
-                Gtk.StyleContext.add_provider_for_display(display, cssProvider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
-            window._kiwiVersionCssProvider = cssProvider;
-        }
+        // Custom CSS for the version pill
+        const cssProvider = new Gtk.CssProvider();
+        cssProvider.load_from_path(GLib.build_filenamev([this.path, 'css', 'prefs.css']));
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), cssProvider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
 
         //
         // About Page (First Page)
@@ -160,22 +149,13 @@ export default class KiwiPreferences extends ExtensionPreferences {
         });
 
         // Logo centered — Gtk.Picture scales with the window (matches kiwi-menu)
-        try {
-            const logoPath = this.path + '/icons/kiwi_logo.png';
-            const logoFile = Gio.File.new_for_path(logoPath);
-            if (logoFile.query_exists(null)) {
-                const logoImage = new Gtk.Picture({
-                    file: logoFile,
-                    width_request: 128,
-                    height_request: 128,
-                    content_fit: Gtk.ContentFit.CONTAIN,
-                    halign: Gtk.Align.CENTER,
-                });
-                headerBox.append(logoImage);
-            }
-        } catch (e) {
-            console.error('Failed to load Kiwi logo:', e);
-        }
+        headerBox.append(new Gtk.Picture({
+            file: Gio.File.new_for_path(`${this.path}/icons/kiwi_logo.png`),
+            width_request: 128,
+            height_request: 128,
+            content_fit: Gtk.ContentFit.CONTAIN,
+            halign: Gtk.Align.CENTER,
+        }));
 
         // Title
         const titleLabel = new Gtk.Label({
@@ -193,32 +173,19 @@ export default class KiwiPreferences extends ExtensionPreferences {
         headerBox.append(authorLabel);
 
         // Version pill
-        const metadataVersionName = this.metadata['version-name'];
-        const metadataVersionRaw = this.metadata.version;
-        const metadataVersionString = typeof metadataVersionRaw === 'number'
-            ? (Number.isFinite(metadataVersionRaw) ? `${metadataVersionRaw}` : '')
-            : typeof metadataVersionRaw === 'string'
-                ? metadataVersionRaw.trim()
-                : '';
-        const hasValidNumericVersion = metadataVersionString.length > 0 && !Number.isNaN(Number(metadataVersionString));
-        let versionLabel = metadataVersionName ?? (hasValidNumericVersion ? metadataVersionString : _('Unknown'));
-        if (metadataVersionName && hasValidNumericVersion)
-            versionLabel = `${metadataVersionName} (${metadataVersionString})`;
+        // EGO adds the numeric version on upload; local installs only have version-name
+        const versionName = this.metadata['version-name'];
+        const version = this.metadata.version;
         const versionButton = new Gtk.Button({
-            label: versionLabel,
+            label: version ? `${versionName} (${version})` : versionName,
             halign: Gtk.Align.CENTER,
             margin_top: 4,
             tooltip_text: _('Change log'),
         });
         versionButton.add_css_class('pill');
         versionButton.add_css_class('kiwi-version-button');
-        const releasesBaseUrl = 'https://github.com/kem-a/kiwi-kemma/releases';
         versionButton.connect('clicked', () => {
-            let targetUrl = releasesBaseUrl;
-            if (metadataVersionName && metadataVersionName !== _('Unknown'))
-                targetUrl = `${releasesBaseUrl}/tag/v${encodeURIComponent(metadataVersionName)}`;
-
-            Gtk.show_uri(null, targetUrl, Gdk.CURRENT_TIME);
+            Gtk.show_uri(null, `https://github.com/kem-a/kiwi-kemma/releases/tag/v${encodeURIComponent(versionName)}`, Gdk.CURRENT_TIME);
         });
         headerBox.append(versionButton);
 
@@ -897,8 +864,8 @@ export default class KiwiPreferences extends ExtensionPreferences {
             _('Button Type'),
             _('Choose the button icon set'),
             'button-type',
-            ['titlebuttons', 'titlebuttons-alt'],
-            [_('Default'), _('Alternative')]
+            ['titlebuttons', 'titlebuttons-alt', 'titlebuttons-glass'],
+            [_('Default'), _('Alternative'), _('Glass')]
         );
         buttonsExpander.add_row(buttonTypeRow);
 
@@ -1097,10 +1064,9 @@ export default class KiwiPreferences extends ExtensionPreferences {
             { title: 'Superbar', author: 'Furkan-rgb', url: 'https://github.com/Furkan-rgb/superbar' },
             { title: 'Compiz alike magic lamp effect', author: 'hermes83', url: 'https://extensions.gnome.org/extension/3740/' }, 
             { title: 'AppIndicator Support', author: '3v1n0', url: 'https://extensions.gnome.org/extension/615/' },
-            { title: 'Clipboard Indicator', author: 'Tudmotu', url: 'https://extensions.gnome.org/extension/779/' },
+            { title: 'Blur My Shell', author: 'aunetx', url: 'https://github.com/aunetx/blur-my-shell' },
             { title: 'Light Style', author: 'fmuellner', url: 'https://extensions.gnome.org/extension/6198/' },
             { title: 'Weather or Not', author: 'somepaulo', url: 'https://extensions.gnome.org/extension/5660/' },
-            { title: 'Blur My Shell', author: 'aunetx', url: 'https://github.com/aunetx/blur-my-shell' },
         ];
 
         recommendedExtensions.forEach((rec) => {
